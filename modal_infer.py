@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import subprocess
 from typing import Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
+import tempfile
 
 def ensure_utf8_stdio() -> None:
     for name in ("stdout", "stderr"):
@@ -72,6 +73,7 @@ AUDIO_SUFFIXES = {
     ".wmv",
 }
 VIDEO_NEED_CONVERT = {".mp4"}  # 需要用户手动转换的格式
+VIDEO_CONVERT_BEFORE_UPLOAD = {".mkv"}  # 上传前自动转换为 mp3
 DEFAULT_GPU_CHOICES = [
     "T4",
     "L4",
@@ -352,12 +354,40 @@ def upload_single_file(
 
     # 使用固定文件名避免全角字符等问题
     original_filename = audio_file.name
-    safe_filename = "todo" + audio_file.suffix.lower()
+
+    upload_file = audio_file
+    temp_dir: Optional[str] = None
+
+    # 对 mkv 自动抽取音频后再上传，避免在远端处理容器封装格式
+    if audio_file.suffix.lower() in VIDEO_CONVERT_BEFORE_UPLOAD:
+        temp_dir = tempfile.mkdtemp(prefix="modal_upload_")
+        upload_file = Path(temp_dir) / f"{audio_file.stem}.mp3"
+        logging.info("检测到 %s，先本地转换为 mp3 再上传：%s", audio_file.suffix.lower(), upload_file)
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(audio_file),
+            "-vn",
+            "-acodec",
+            "libmp3lame",
+            str(upload_file),
+        ]
+        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+
+    safe_filename = "todo" + upload_file.suffix.lower()
 
     with volume.batch_upload(force=True) as batch:
         remote_rel = remote_session_rel / safe_filename
         logging.info("上传文件 -> %s", rel_to_volume_path(remote_rel))
-        batch.put_file(str(audio_file), rel_to_volume_path(remote_rel))
+        batch.put_file(str(upload_file), rel_to_volume_path(remote_rel))
+
+    if temp_dir:
+        try:
+            Path(upload_file).unlink(missing_ok=True)
+            Path(temp_dir).rmdir()
+        except OSError:
+            pass
 
     # 如果指定了 base_dir（文件夹模式），输出到 base_dir；否则输出到文件所在目录
     local_output_dir = base_dir if base_dir else audio_file.parent
